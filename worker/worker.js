@@ -706,7 +706,8 @@ async function mirrorOfficialFriend(env, playerId) {
 }
 /** Puts back a friendship with OCTIVE that an older game removed (OCTIVE can't be removed). */
 async function refriendOfficial(env, playerId) {
-  const r = await socialAdmin(env, "POST", "/relationships?withPresence=false&withProfile=false", { type: "FRIEND", members: [{ id: OFFICIAL_ID }, { id: playerId }] }, playerId);
+  let r = await socialAdmin(env, "POST", "/relationships?withPresence=false&withProfile=false", { type: "FRIEND", members: [{ id: OFFICIAL_ID }, { id: playerId }] }, playerId);
+  if (r.status === 409) r = await socialAdmin(env, "POST", "/relationships?withPresence=false&withProfile=false", { type: "FRIEND", members: [{ id: playerId }, { id: OFFICIAL_ID }] }, OFFICIAL_ID);
   if (!((r.status >= 200 && r.status < 300) || r.status === 409)) throw new Error(`Unity Friends ${r.status}: ${r.text.slice(0, 200)}`);
   await mirrorOfficialFriend(env, playerId);
 }
@@ -716,11 +717,16 @@ async function befriendOfficial(env, playerId) {
   if (!/^[A-Za-z0-9_-]{8,64}$/.test(playerId || "") || isOfficial(playerId)) return "skipped";
   if (officialFriendsDone.has(playerId)) return "already";
   const key = `official-friends/${playerId}`;
-  if (await env.RELEASES.head(key).catch(() => null)) { officialFriendsDone.add(playerId); return "already"; }
-  const r = await socialAdmin(env, "POST", "/relationships?withPresence=false&withProfile=false", { type: "FRIEND", members: [{ id: OFFICIAL_ID }, { id: playerId }] }, playerId);
-  // 409: they're friends already (or one blocked the other): either way, don't try again
+  // done before: unless it was a "409" from before OCTIVE could accept waiting requests (v2), which is tried once more
+  const mark = await r2json(env, key, null).catch(() => null);
+  if (mark && (mark.status !== 409 || mark.v >= 2)) { officialFriendsDone.add(playerId); return "already"; }
+  const body = { type: "FRIEND", members: [{ id: OFFICIAL_ID }, { id: playerId }] };
+  let r = await socialAdmin(env, "POST", "/relationships?withPresence=false&withProfile=false", body, playerId);
+  // 409: a friend request is already waiting between them (the player asked OCTIVE before), or they're friends,
+  // or one blocked the other. OCTIVE accepts a waiting request; still 409 means friends already (or blocked).
+  if (r.status === 409) r = await socialAdmin(env, "POST", "/relationships?withPresence=false&withProfile=false", { type: "FRIEND", members: [{ id: playerId }, { id: OFFICIAL_ID }] }, OFFICIAL_ID);
   if ((r.status >= 200 && r.status < 300) || r.status === 409) {
-    await env.RELEASES.put(key, JSON.stringify({ at: new Date().toISOString(), status: r.status }), { httpMetadata: { contentType: "application/json" } });
+    await env.RELEASES.put(key, JSON.stringify({ at: new Date().toISOString(), status: r.status, v: 2 }), { httpMetadata: { contentType: "application/json" } });
     officialFriendsDone.add(playerId);
     await mirrorOfficialFriend(env, playerId).catch((e) => console.log("official friend list", e && e.message));
     return r.status === 409 ? "already friends" : "friended";
@@ -2650,10 +2656,12 @@ async function supportRoutes(request, env, url, ctx) {
       }
     }
     const cents = priceFor(months), pct = Math.round(discountFor(months) * 100);
+    // from the game: the payment window ends on a small page that says to go back (and closes itself)
+    const fromGame = b.from === "game";
     const s = await stripe(env, "checkout/sessions", {
       mode: "payment",
-      success_url: `${SITE}#/supporter?thanks=1`,
-      cancel_url: `${SITE}#/supporter`,
+      success_url: fromGame ? `${url.origin}/support/done?paid=1` : `${SITE}#/supporter?thanks=1`,
+      cancel_url: fromGame ? `${url.origin}/support/done?cancel=1` : `${SITE}#/supporter`,
       client_reference_id: target,
       "metadata[playerId]": target,
       "metadata[months]": String(months),
@@ -2667,7 +2675,28 @@ async function supportRoutes(request, env, url, ctx) {
       "payment_intent_data[metadata][playerId]": target,
       "payment_intent_data[metadata][months]": String(months),
     });
-    return reply({ url: s.url });
+    return reply({ url: s.url, session: s.id });
+  }
+  if (path === "/support/session") {
+    // the game asks whether its checkout was paid (gifts too: they only show for the buyer this way)
+    const who = await signedIn(request, env);
+    const id = String(url.searchParams.get("id") || "");
+    if (!/^cs_[A-Za-z0-9_]{10,200}$/.test(id)) fail(400, "That checkout can't be found.");
+    const s = await stripe(env, "checkout/sessions/" + encodeURIComponent(id));
+    if (s.metadata?.buyer !== who.playerId) fail(404, "That checkout can't be found.");
+    return reply({ paid: s.payment_status === "paid", status: s.status, months: Number(s.metadata?.months) || 0, gift: s.metadata?.gift === "1", to: s.metadata?.playerId || null });
+  }
+  if (path === "/support/done") {
+    // where the game's payment window lands: thanks (or nothing charged), then it closes itself
+    const paid = url.searchParams.get("paid") === "1";
+    const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OCTIVE</title><style>
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#090b14;color:#fff;font-family:"Segoe UI",system-ui,sans-serif;text-align:center}
+.c{padding:40px 32px;max-width:420px}.h{width:88px;height:88px;margin:0 auto 20px;border-radius:28px;display:flex;align-items:center;justify-content:center;font-size:46px;background:rgba(255,107,181,.16);border:1px solid rgba(255,107,181,.5);color:#ff6bb5}
+h1{margin:0 0 10px;font-size:30px}p{margin:0;color:#aab0c4;line-height:1.55}.s{margin-top:16px;font-size:13px;color:#7a8099}</style></head><body><div class="c">
+<div class="h">${paid ? "&#9829;" : "&#10005;"}</div><h1>${paid ? "Thank you!" : "Payment cancelled"}</h1>
+<p>${paid ? "Your payment went through. Go back to OCTIVE: it's updating there now." : "Nothing was charged. Go back to OCTIVE to choose again."}</p>
+<p class="s">You can close this window.</p></div><script>setTimeout(function(){try{window.close()}catch(e){}},${paid ? 2600 : 1400})</script></body></html>`;
+    return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
   }
   if (path === "/support/grant") {
     // the developer (Senterra) gives supporter time for free
@@ -4472,7 +4501,7 @@ async function workshopRoutes(request, env, url, ctx) {
       let cursor;
       do {
         const list = await env.RELEASES.list({ prefix: "official-friends/", cursor });
-        for (const o of list.objects) officialFriendsDone.add(o.key.slice("official-friends/".length));
+        for (const o of list.objects) if (!b.recheck) officialFriendsDone.add(o.key.slice("official-friends/".length));
         cursor = list.truncated ? list.cursor : undefined;
       } while (cursor);
     }
