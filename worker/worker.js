@@ -1105,8 +1105,15 @@ async function account(request, env, route) {
       const card = pub.card || {};
       const st = supportStatus(sup, id, boost);
       const uploads = (db.items || []).filter((x) => x.creatorId === id && !x.removed).map(wsPublic);
+      // how they sign in: their OCTIVE username, and any other ways linked to the account (Unity's admin API)
+      let signInName = null, signInWith = [];
+      try {
+        const u = await admin(env, "GET", `${identity(env)}/users/${encodeURIComponent(id)}`);
+        signInName = u?.usernamePasswordLoginMetadata?.username || u?.username || null;
+        signInWith = (u?.externalIds || []).map((x) => x.providerId).filter((x) => x && x !== "username");
+      } catch (e) { console.log("inspect sign-in", e && e.message); }
       return reply({
-        playerId: id, name: card.name || null, hasCard: !!pub.card,
+        playerId: id, name: card.name || null, hasCard: !!pub.card, signInName, signInWith,
         version: card.version || null, ppVersion: card.ppVersion || null, platform: pub.platform || null,
         lastSeenGame: pub.seen || null, lastSeenWebsite: web ? web.uploaded.toISOString() : null,
         badges: badgesOf(id), check: checkOf(id), banned: moderation.bans[id] || null, overrides: moderation.overrides[id] || null,
