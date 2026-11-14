@@ -22,7 +22,8 @@ const BOARD_TTL = 60_000;          // ranking refresh
 const CARD_TTL = 3 * 60_000;       // public card + online status refresh
 const CARD_FETCH_BUDGET = 40;      // cards fetched per request (Cloudflare free plan: 50 subrequests)
 const ONLINE_MS = 5 * 60_000;
-const PP_VERSION = 3;              // the game's PP formula (Performance.Version); older totals are listed after      // "online" when the game wrote its heartbeat this recently
+const PP_VERSION = 3;              // the PP rework (1.3.3): totals from older formulas are listed after, as "before rework"
+const PP_LATEST = 4;               // the game's newest PP formula (Performance.Version; 4 = 1.6.0's osu! accuracy)
 const DEVELOPERS = ["PlwcYVKV9y7NBFWfUaC263XpCFbE"]; // same list as the game's PlayerRoles
 
 let board = null, boardAt = 0, boardBuildingAt = 0;
@@ -232,11 +233,10 @@ async function rankFromPlays(env, cfg, playerId) {
     if (resetAt && !(Date.parse(c.lastPlayed) > resetAt)) { oldAfterReset = true; continue; }
     if (c.fullCombo === true) fullCombos++;
     if (isInt(c.maxCombo, 0, V.maxCombo)) bestCombo = Math.max(bestCombo, c.maxCombo);
-    if (!(typeof c.bestPP === "number" && c.bestPP > 0)) continue;
+    if (!(isNum(c.bestPP, 0, V.maxTotalPR) && c.bestPP > 0)) continue;
     const why =
       !isNum(c.stars, 0, V.maxStars) ? `stars ${c.stars}` :
       !isNum(c.ppAccuracy, 0, 100) ? `accuracy ${c.ppAccuracy}` :
-      !isNum(c.bestPP, 0, playPRMax(c.stars, c.ppAccuracy)) ? `${c.bestPP} PR on a ${c.stars}★ chart at ${c.ppAccuracy}%` :
       c.bestScore !== undefined && !isInt(c.bestScore, 0, SCORE_MAX) ? `score ${c.bestScore}` :
       c.bestAccuracy !== undefined && !isNum(c.bestAccuracy, 0, 100) ? `accuracy ${c.bestAccuracy}` : null;
     if (why) { problems.push(`${String(key).slice(0, 60)}: ${why}`); continue; }
@@ -254,8 +254,10 @@ async function rankFromPlays(env, cfg, playerId) {
     totalScore: fresh ? 0 : cleanInt(data.totalScore, 0, V.maxBig, 0),
     playTimeMs: fresh ? 0 : cleanInt(data.playTimeMs, 0, V.maxPlayTimeMs, 0),
     fullCombos, maxCombo: bestCombo,
-    ppVersion: isInt(data.ppVersion, 0, 100) && data.ppVersion >= PP_VERSION ? PP_VERSION : 2,
+    // the formula the game worked the plays out with (1.6 games show anything older than theirs as out of date)
+    ppVersion: isInt(data.ppVersion, 0, 100) && data.ppVersion >= PP_VERSION ? Math.min(data.ppVersion, PP_LATEST) : 2,
     counted: plays.length, problems,
+    charts, resetAt,
   };
 }
 
@@ -766,6 +768,27 @@ async function saveAsPlayer(env, token, playerId, key, value, isPublic) {
   }
 }
 
+/**
+ * Adds or replaces a player's ranking entry. Unity's admin API has no way to write a score (it answers 404), so this
+ * is the Leaderboards player API with the service account's token; the project policy only stops players writing
+ * their own.
+ */
+async function writeScore(env, playerId, score, metadata) {
+  const url = `https://leaderboards.services.api.unity.com/v1/projects/${env.UGS_PROJECT_ID}/leaderboards/${LEADERBOARD}/scores/players/${encodeURIComponent(playerId)}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: "Bearer " + (await statelessToken(env)), Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify({ score, metadata }),
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    const e = new Error(`Unity returned ${res.status} for the ranking: ${text.slice(0, 300)}`);
+    e.status = res.status;
+    throw e;
+  }
+  try { return text ? JSON.parse(text) : {}; } catch { return {}; }
+}
+
 async function saveItem(env, playerId, key, value, isPublic) {
   await admin(env, "POST", `${config(env).save}/players/${encodeURIComponent(playerId)}/${isPublic ? "public/" : ""}items`, { key, value });
 }
@@ -1139,7 +1162,9 @@ async function account(request, env, route) {
       await loadModeration(cfg);
       if (moderation.bans[id]) fail(403, "This account is banned.");
       const r = await rankFromPlays(env, cfg, id);
-      if (r.problems.length) await flagPlayer(env, id, `${r.problems.length} impossible play${r.problems.length === 1 ? "" : "s"} left out: ${r.problems.slice(0, 3).join("; ")}`);
+      // dan clears on copies the game didn't know were dans (never holds up the ranking)
+      let dansFound = 0;
+      try { dansFound = await danClearsFromPlays(env, id, r.charts, r.resetAt); } catch (err) { console.log("dans from plays", err && err.message); }
       // a jump bigger than a day of real playing waits for a moderator
       const { key, rec } = await paceCheck(env, cfg, id, now);
       rec.hist = (rec.hist || []).filter((h) => now - h.t < 86_400_000);
@@ -1191,7 +1216,7 @@ async function account(request, env, route) {
       await serverWrite(async () => {
         if (!official) {
           const meta = { n: name, l: pub.level, lp: pub.levelProgress, a: pub.accuracy, av: avatarHash, ts: pub.totalScore, pc: pub.playCount, fc: pub.fullCombos, pv: pub.ppVersion };
-          const e = await admin(env, "POST", `${cfg.scores}/players/${encodeURIComponent(id)}`, { score: pub.pp, metadata: meta });
+          const e = await writeScore(env, id, pub.pp, meta);
           rank = isInt(e?.rank, 0, 1e9) ? e.rank + 1 : 0;
         }
         card.rank = rank;
@@ -1203,7 +1228,7 @@ async function account(request, env, route) {
       rec.at = new Date(now).toISOString();
       await env.RELEASES.put(key, JSON.stringify(rec), { httpMetadata: { contentType: "application/json" } });
       cards.delete(id);
-      return reply({ ok: true, pp: pub.pp, level: pub.level, rank, held, leftOut: r.problems.length, counted: r.counted });
+      return reply({ ok: true, pp: pub.pp, level: pub.level, rank, held, leftOut: r.problems.length, counted: r.counted, dans: dansFound || undefined });
     }
     case "rank/seen": {
       // the online heartbeat (written by the server: nobody can make anyone else look online)
@@ -1247,7 +1272,7 @@ async function account(request, env, route) {
         const pub = await publicItems(cfg, id, ["card"]).catch(() => ({}));
         const old = safeCard(pub.card);
         await saveItem(env, id, "card", { ...old, pp: 0, accuracy: 0, level: 1, levelProgress: 0, totalScore: 0, xp: 0, playCount: 0, fullCombos: 0, maxCombo: 0, playTimeMs: 0, rank: 0, achievements: {} }, true);
-        await saveItem(env, id, "scores", JSON.stringify({ version: 1, charts: {}, recent: [], totalPlays: 0, totalNotesHit: 0, totalScore: 0, xp: 0, playTimeMs: 0, ppVersion: PP_VERSION }), false);
+        await saveItem(env, id, "scores", JSON.stringify({ version: 1, charts: {}, recent: [], totalPlays: 0, totalNotesHit: 0, totalScore: 0, xp: 0, playTimeMs: 0, ppVersion: PP_LATEST }), false);
         // the game sees this, and starts that account over on every device
         await saveItem(env, id, "statsReset", at, false);
       });
@@ -2592,6 +2617,74 @@ async function stripeSignatureOk(env, header, body) {
 
 /** Adds bought months to a player's record (once per checkout session). */
 /** Gifts wait in gifts/<playerId>.json until the player claims them on the website. */
+// ---- recent supporter purchases and gifts (the in-game supporter screen's feed), newest first
+// R2 support/recent.json { items: [{ at, months, cents (paid), full (months x $2.50), free, gift, buyer, to, buyerName, toName, ref }] }
+const RECENT_KEY = "support/recent.json", RECENT_MAX = 60;
+let recentCache = null, recentAt = 0;
+
+async function supportName(env, id) {
+  if (!id) return "";
+  const ov = moderation.overrides[id] || {};
+  if (ov.name) return ov.name;
+  try { return (await displayName(env, id)) || ""; } catch { return ""; }
+}
+
+/** The feed; the first time, built from the purchases and gifts already on record. */
+async function recentSupport(env) {
+  if (recentCache && Date.now() - recentAt < 30_000) return recentCache;
+  let d = await r2json(env, RECENT_KEY, null);
+  if (!d) { d = { items: await backfillRecent(env) }; await r2put(env, RECENT_KEY, d); }
+  recentCache = d.items || []; recentAt = Date.now();
+  return recentCache;
+}
+
+async function backfillRecent(env) {
+  const out = [];
+  for (const prefix of ["supporters/", "gifts/"]) {
+    let cursor;
+    do {
+      const list = await env.RELEASES.list({ prefix, cursor });
+      for (const o of list.objects) {
+        const id = o.key.slice(prefix.length).replace(/\.json$/, "");
+        if (!/^[A-Za-z0-9_-]{8,64}$/.test(id)) continue;
+        const rec = await r2json(env, o.key, null);
+        if (prefix === "supporters/") {
+          for (const p of rec?.purchases || []) {
+            const gift = p.gift !== undefined;
+            const free = String(p.session || "").startsWith("free-") || (gift && !p.amount);
+            out.push({ at: p.at, months: p.months || 0, cents: free ? 0 : p.amount || 0, full: (p.months || 0) * PRICE_CENTS, free, gift, buyer: gift ? p.gift || "" : id, to: id, ref: p.session || null });
+          }
+        } else {
+          for (const g of rec?.pending || [])
+            out.push({ at: g.at, months: g.months || 0, cents: g.free ? 0 : g.amount || 0, full: (g.months || 0) * PRICE_CENTS, free: !!g.free, gift: true, buyer: g.from || "", to: id, ref: g.id || null });
+        }
+      }
+      cursor = list.truncated ? list.cursor : undefined;
+    } while (cursor);
+  }
+  out.sort((a, b) => String(b.at || "").localeCompare(String(a.at || "")));
+  const items = out.slice(0, RECENT_MAX);
+  const names = {};
+  for (const id of new Set(items.flatMap((x) => [x.buyer, x.to]).filter(Boolean))) names[id] = await supportName(env, id);
+  for (const x of items) { x.buyerName = names[x.buyer] || ""; x.toName = names[x.to] || ""; }
+  return items;
+}
+
+/** One new purchase or gift for the feed (once per checkout or gift). */
+async function recordSupport(env, e) {
+  try {
+    await recentSupport(env); // the history is there first
+    const item = { at: new Date().toISOString(), months: e.months, cents: e.free ? 0 : e.cents || 0, full: e.months * PRICE_CENTS, free: !!e.free, gift: !!e.gift,
+      buyer: e.buyer || "", to: e.to || "", buyerName: await supportName(env, e.buyer), toName: await supportName(env, e.to), ref: e.ref || null };
+    await r2update(env, RECENT_KEY, () => ({ items: [] }), (d) => {
+      d.items ||= [];
+      if (item.ref && d.items.some((x) => x.ref === item.ref)) return false;
+      d.items = [item, ...d.items].slice(0, RECENT_MAX);
+    });
+    recentCache = null;
+  } catch (err) { console.log("recent support", err && err.message); }
+}
+
 async function addGift(env, playerId, gift) {
   const key = `gifts/${playerId}.json`;
   const g = await r2json(env, key, { pending: [] });
@@ -2632,6 +2725,7 @@ async function supportRoutes(request, env, url, ctx) {
     for (let m = 1; m <= MAX_MONTHS; m++) tiers.push({ months: m, cents: priceFor(m), discount: discountFor(m) });
     return reply({ monthly: PRICE_CENTS, currency: "usd", tiers, effects: EFFECTS });
   }
+  if (path === "/support/recent") return reply({ items: await recentSupport(env), monthly: PRICE_CENTS });
   if (path === "/support/all") { const all = await supporters(env); return reply({ supporters: all, owner: OWNER, gifted: giftedIndex, numbers: numberIndex }); }
   if (path === "/stripe/webhook" && request.method === "POST") {
     const body = await request.text();
@@ -2641,8 +2735,13 @@ async function supportRoutes(request, env, url, ctx) {
       const s = ev.data.object;
       const id = s.metadata?.playerId, months = Number(s.metadata?.months);
       if (s.payment_status === "paid" && id && months >= 1 && months <= MAX_MONTHS) {
-        if (s.metadata?.gift === "1") await addGift(env, id, { id: s.id, from: s.metadata?.buyer || "", months, amount: s.amount_total, currency: s.currency, free: false });
-        else { await grantMonths(env, id, months, s); supportIndex = null; await syncSupporterRole(env, id); }
+        if (s.metadata?.gift === "1") {
+          await addGift(env, id, { id: s.id, from: s.metadata?.buyer || "", months, amount: s.amount_total, currency: s.currency, free: false });
+          await recordSupport(env, { months, cents: s.amount_total, gift: true, buyer: s.metadata?.buyer || "", to: id, ref: s.id });
+        } else {
+          await grantMonths(env, id, months, s); supportIndex = null; await syncSupporterRole(env, id);
+          await recordSupport(env, { months, cents: s.amount_total, gift: false, buyer: id, to: id, ref: s.id });
+        }
       }
     }
     return new Response("ok");
@@ -2716,7 +2815,9 @@ h1{margin:0 0 10px;font-size:30px}p{margin:0;color:#aab0c4;line-height:1.55}.s{m
     if (!/^[A-Za-z0-9_-]{8,64}$/.test(target)) fail(400, "That player can't be found.");
     const card = (await publicItems(config(env), target, ["card"])).card;
     if (!card || moderation.bans[target]) fail(400, "That player can't be found (they need to have played online once).");
-    await addGift(env, target, { id: "free-" + crypto.randomUUID(), from: who.playerId, months, amount: 0, currency: "usd", free: true });
+    const giftId = "free-" + crypto.randomUUID();
+    await addGift(env, target, { id: giftId, from: who.playerId, months, amount: 0, currency: "usd", free: true });
+    await recordSupport(env, { months, free: true, gift: true, buyer: who.playerId, to: target, ref: giftId });
     return reply({ ok: true, name: card.name || "", pending: true });
   }
   if (path === "/support/gifts") {
@@ -3458,6 +3559,9 @@ async function wsMeta(kind, u8) {
         charts: (Array.isArray(m.charts) ? m.charts : []).slice(0, 60).map((c) => ({
           difficulty: String(c.difficulty || "").slice(0, 100), keys: Number(c.keyCount) || 0, stars: Math.round((Number(c.rating) || 0) * 100) / 100,
           notes: Number(c.noteCount) || 0, creator: String(c.creator || "").slice(0, 60),
+          // the chart's own id, and (charts from osu!) its .osu file's MD5: what the verified-copy check compares
+          chartId: typeof c.chartId === "string" && /^[A-Za-z0-9_.:-]{1,80}$/.test(c.chartId) ? c.chartId : undefined,
+          osuMd5: typeof c.osuMd5 === "string" && /^[0-9a-f]{32}$/i.test(c.osuMd5) ? c.osuMd5.toLowerCase() : undefined,
           od: Number.isFinite(Number(c.od)) && c.od !== null && Number(c.od) >= 0 && Number(c.od) <= 10 ? Number(c.od) : undefined,
         })),
       };
@@ -3753,6 +3857,137 @@ async function dailyOf(env, date) {
 }
 
 /** Accuracy from judgement counts (Marvelous..Miss), worked out here. Null when they don't fit the chart. */
+// ---- dans from any copy. A dan is marked on one upload's song, but players may have the same chart from another upload
+// or from their own osu! import. A song's id is its artist and title plus a random end ("...-staminamap-pack-5279c3"),
+// and an osu! import's board id names its beatmap set ("osu-611978"): so a dan is found by its exact song, by its song
+// id without that end, or by its osu! set, each with the difficulty's name. Clears are kept under the marked song.
+let danIdx = null, danIdxAt = 0;
+const songSlug = (id) => String(id || "").replace(/-[0-9a-f]{6}$/, "");
+async function danIndex(env) {
+  if (danIdx && Date.now() - danIdxAt < 60_000) return danIdx;
+  const db = await r2json(env, WS_DB, { items: [] });
+  const idx = new Map();
+  for (const it of (db.items || []).filter((x) => !x.removed && Array.isArray(x.dans))) {
+    const songs = (it.meta && it.meta.songs) || [];
+    for (const d of it.dans) {
+      const song = songs.find((x) => x.songId === d.songId);
+      const chart = song && (song.charts || []).find((c) => c.difficulty === d.difficulty);
+      if (!chart) continue;
+      const e = { it, dan: d, song, chart };
+      for (const k of [`id|${d.songId}|${d.difficulty}`, `slug|${songSlug(d.songId)}|${d.difficulty}`, song.osuSet ? `osu|${song.osuSet}|${d.difficulty}` : null])
+        if (k && !idx.has(k)) idx.set(k, e);
+    }
+  }
+  danIdx = idx; danIdxAt = Date.now();
+  return idx;
+}
+function findDan(idx, songId, difficulty, board) {
+  const set = /^osu-(\d+)$/.exec(String(board || ""))?.[1];
+  const exact = idx.get(`id|${songId}|${difficulty}`);
+  if (exact) return { ...exact, via: "id" };
+  const other = idx.get(`slug|${songSlug(songId)}|${difficulty}`) || (set ? idx.get(`osu|${set}|${difficulty}`) : null);
+  return other ? { ...other, via: "copy" } : null;
+}
+// ---- a copy of a verified chart that's been changed (its notes, keys or stars) doesn't count for dans or dailies and
+// can't be picked in multiplayer: the player is told to redownload the verified map. Notes and keys must be the same;
+// stars within 0.1, and only for uploads rated with the game's current star rating (v3, from 1.3.3), since an older
+// upload's stored stars differ for unchanged charts too.
+const STAR_VERSION = 3, STARS_V3_FROM = Date.parse("2026-11-12T00:00:00Z");
+function chartProblems(it, chart, local, songId, via) {
+  if (!local || typeof local !== "object" || !chart) return [];
+  const out = [];
+  // the chart itself. The verified upload's own song must be that very chart (its chart id); a copy from elsewhere (an
+  // osu! import, another upload) has an id of its own, so the osu! difficulty file it came from (MD5) is compared: an
+  // edited or updated osu! map has another. Each only when both sides know it.
+  const md5 = typeof local.osuMd5 === "string" && /^[0-9a-f]{32}$/i.test(local.osuMd5) ? local.osuMd5.toLowerCase() : null;
+  if (via === "id" && chart.chartId && typeof local.chartId === "string" && local.chartId && local.chartId !== chart.chartId) out.push("a different chart");
+  else if (chart.osuMd5 && md5 && md5 !== chart.osuMd5) out.push("a different version of the osu! map");
+  const n = Number(local.notes), k = Number(local.keys), s = Number(local.stars);
+  if (chart.notes > 0 && Number.isInteger(n) && n > 0 && n !== chart.notes) out.push(`${n} notes instead of ${chart.notes}`);
+  if (chart.keys > 0 && Number.isInteger(k) && k > 0 && k !== chart.keys) out.push(`${k}K instead of ${chart.keys}K`);
+  const when = it && (it.updatedAt || it.at); // milliseconds (or an ISO date)
+  const rated = typeof when === "number" ? when : Date.parse(when || "") || 0;
+  // OCTIVE's own songs carry hand-set difficulty numbers, not worked-out stars: their notes and keys are checked
+  const ownSong = (it && it.builtin) || officialSong(songId);
+  if (!ownSong && Number(local.sv) === STAR_VERSION && rated >= STARS_V3_FROM && chart.stars > 0 && Number.isFinite(s) && s > 0 && Math.abs(s - chart.stars) > 0.1)
+    out.push(`${s.toFixed(2)}★ instead of ${Number(chart.stars).toFixed(2)}★`);
+  return out;
+}
+function failModified(problems, itemId, what = "it") {
+  const e = new HttpError(409, `Your copy of this chart isn't the verified one (${problems.join(", ")}), so ${what} won't count. Redownload the verified map from the Workshop.`);
+  e.code = "modified"; e.itemId = itemId || undefined;
+  throw e;
+}
+/** Verified uploads' charts (and every dan's), by exact song and by osu! beatmap set: what a copy is checked against. */
+let verIdx = null, verIdxAt = 0;
+async function verifiedIndex(env) {
+  if (verIdx && Date.now() - verIdxAt < 60_000) return verIdx;
+  const db = await r2json(env, WS_DB, { items: [] });
+  const idx = new Map();
+  for (const it of (db.items || []).filter((x) => !x.removed && (x.verified || (Array.isArray(x.dans) && x.dans.length))))
+    for (const song of (it.meta && it.meta.songs) || [])
+      for (const chart of song.charts || [])
+        for (const k of [`id|${song.songId}|${chart.difficulty}`, song.osuSet ? `osu|${song.osuSet}|${chart.difficulty}` : null])
+          if (k && !idx.has(k)) idx.set(k, { it, song, chart });
+  verIdx = idx; verIdxAt = Date.now();
+  return idx;
+}
+function findVerified(idx, songId, difficulty, board) {
+  const set = /^osu-(\d+)$/.exec(String(board || ""))?.[1];
+  const exact = idx.get(`id|${songId}|${difficulty}`);
+  if (exact) return { ...exact, via: "id" };
+  const osu = set ? idx.get(`osu|${set}|${difficulty}`) : null;
+  return osu ? { ...osu, via: "osu" } : null;
+}
+
+/** Writes dan clears ({ e, acc, at }) to a wallet when they beat what's there; the wallet when anything changed. */
+async function recordDanClears(env, playerId, found) {
+  if (!found.length) return null;
+  return walletUpdate(env, playerId, (w) => {
+    w.dans ||= {};
+    let changed = false;
+    for (const { e, acc, at } of found) {
+      const key = `${e.dan.songId}|${e.dan.difficulty}`;
+      const a = Math.round(acc * 100) / 100;
+      if (w.dans[key] && w.dans[key].acc >= a) continue;
+      const when = Date.parse(at);
+      w.dans[key] = { level: e.dan.level, acc: a, at: Number.isFinite(when) ? new Date(when).toISOString() : new Date().toISOString(),
+        title: String(e.song.title || e.it.title || "").slice(0, 80), difficulty: String(e.dan.difficulty).slice(0, 60) };
+      remember(w, { kind: "dan", level: e.dan.level, acc: a });
+      changed = true;
+    }
+    if (!changed) return false;
+  });
+}
+/**
+ * Dan clears in a player's synced plays: any copy of a dan's chart, no mods, at the clear accuracy or more (worked out
+ * here from the play's judgements against the dan's own chart). The game sends a clear when the play ends, but only
+ * for copies it knows are dans: other copies, and older games, are caught here. How many were new or better.
+ */
+async function danClearsFromPlays(env, playerId, charts, resetAt) {
+  const idx = await danIndex(env);
+  if (!idx.size || !Array.isArray(charts)) return 0;
+  const found = [];
+  for (const [key, c] of charts) {
+    if (!c || typeof c !== "object" || typeof c.difficulty !== "string") continue;
+    const e = findDan(idx, String(key).split("/")[0], c.difficulty, c.board);
+    if (!e) continue;
+    if (chartProblems(e.it, e.chart, { keys: c.keyCount, stars: c.stars, sv: STAR_VERSION, chartId: String(key).split("/")[1] }, e.dan.songId, e.via).length) continue; // a changed copy
+    let best = null;
+    for (const p of Array.isArray(c.top) ? c.top : []) {
+      if (!p || typeof p !== "object" || p.failed === true || (p.mods && String(p.mods).trim())) continue;
+      if (resetAt && !(Date.parse(p.date) > resetAt)) continue;
+      const acc = countsAccuracy(p.counts, e.chart.notes);
+      if (acc !== null && acc >= DAN_CLEAR_ACC && (!best || acc > best.acc)) best = { e, acc, at: p.date };
+    }
+    if (best) found.push(best);
+  }
+  const before = found.length;
+  const w = await recordDanClears(env, playerId, found);
+  if (w) await writeCosmetics(env, playerId, w);
+  return w ? before : 0;
+}
+
 function countsAccuracy(counts, notes) {
   if (!Array.isArray(counts) || counts.length !== 6) return null;
   const c = counts.map((n) => Math.round(Number(n)));
@@ -3875,7 +4110,7 @@ async function playRoutes(request, env, url) {
   }
   if (path === "/play/daily/start" && request.method === "POST") {
     const who = await signedIn(request, env);
-    const b = await bodyOf(request, 1_000);
+    const b = await bodyOf(request, 4_000);
     await loadModeration(config(env)).catch(() => {});
     if (moderation.bans[who.playerId]) fail(403, "This account is banned.");
     const t = dailyTier(String(b.tier || ""));
@@ -3883,6 +4118,14 @@ async function playRoutes(request, env, url) {
     const date = todayUtc();
     const d = await dailyOf(env, date);
     if (!d.charts[t.tier]) fail(404, `There's no ${t.name} daily chart today.`);
+    if (b.chart && typeof b.chart === "object") {
+      const dc = d.charts[t.tier];
+      const it = ((await r2json(env, WS_DB, { items: [] })).items || []).find((x) => x.id === dc.itemId);
+      // the upload's own record of the chart (its id and osu! fingerprint), else what the day kept
+      const mc = ((it && it.meta && it.meta.songs) || []).find((x) => x.songId === dc.songId)?.charts?.find((x) => x.difficulty === dc.difficulty);
+      const changed = chartProblems(it, mc || dc, b.chart, dc.songId, String(b.chart.songId || "") === dc.songId ? "id" : "osu");
+      if (changed.length) failModified(changed, dc.itemId, "the daily chart");
+    }
     const key = attemptKey(d, date, t.tier);
     let used = false;
     const w = await walletUpdate(env, who.playerId, (w) => {
@@ -4127,37 +4370,43 @@ async function playRoutes(request, env, url) {
     const db = await r2json(env, WS_DB, { items: [] });
     const dans = [];
     for (const it of (db.items || []).filter((x) => !x.removed && Array.isArray(x.dans)))
-      for (const d of it.dans) dans.push({ itemId: it.id, songId: d.songId, difficulty: d.difficulty, level: d.level, title: it.title });
+      for (const d of it.dans) {
+        const song = ((it.meta && it.meta.songs) || []).find((x) => x.songId === d.songId);
+        dans.push({ itemId: it.id, songId: d.songId, difficulty: d.difficulty, level: d.level, title: it.title, osuSet: song && song.osuSet ? song.osuSet : undefined });
+      }
     dans.sort((a, b) => DAN_LEVELS.indexOf(a.level) - DAN_LEVELS.indexOf(b.level));
     return reply({ dans, levels: DAN_LEVELS, clearAcc: DAN_CLEAR_ACC });
+  }
+  // ---- is this copy the verified chart? (a few at once)
+  if (path === "/play/chart-check" && request.method === "POST") {
+    const b = await bodyOf(request, 20_000);
+    const idx = await verifiedIndex(env);
+    const charts = (Array.isArray(b.charts) ? b.charts : []).slice(0, 40).map((c) => {
+      const e = c && typeof c === "object" ? findVerified(idx, String(c.songId || ""), String(c.difficulty || ""), c.board) : null;
+      if (!e) return { verified: false, ok: true };
+      const problems = chartProblems(e.it, e.chart, c, e.song.songId, e.via);
+      return { verified: true, ok: problems.length === 0, problems, itemId: e.it.id, title: e.song.title || e.it.title, difficulty: e.chart.difficulty };
+    });
+    return reply({ charts });
   }
   if (path === "/play/dan/clear" && request.method === "POST") {
     const who = await signedIn(request, env);
     const b = await bodyOf(request, 4_000);
     if (String(b.mods || "").trim()) fail(400, "Dans are played without mods.");
-    const db = await r2json(env, WS_DB, { items: [] });
     const songId = String(b.songId || ""), difficulty = String(b.difficulty || "");
-    const it = (db.items || []).find((x) => !x.removed && Array.isArray(x.dans) && x.dans.some((d) => d.songId === songId && d.difficulty === difficulty));
-    if (!it) fail(404, "That difficulty isn't a dan.");
-    const dan = it.dans.find((d) => d.songId === songId && d.difficulty === difficulty);
-    const song = ((it.meta && it.meta.songs) || []).find((s) => s.songId === songId);
-    const chart = song && (song.charts || []).find((c) => c.difficulty === difficulty);
-    if (!chart) fail(404, "That difficulty isn't in the Workshop upload any more.");
-    const acc = countsAccuracy(b.counts, chart.notes);
+    // the marked song, or any copy of it (another upload, their own osu! import)
+    const e = findDan(await danIndex(env), songId, difficulty, b.board);
+    if (!e) fail(404, "That difficulty isn't a dan.");
+    const changed = chartProblems(e.it, e.chart, b.chart, e.dan.songId, e.via);
+    if (changed.length) failModified(changed, e.it.id, "the dan");
+    const acc = countsAccuracy(b.counts, e.chart.notes);
     if (acc === null) fail(400, "That play doesn't match the dan.");
     const cleared = acc >= DAN_CLEAR_ACC;
-    let w = null;
     if (cleared) {
-      const key = `${songId}|${difficulty}`;
-      w = await walletUpdate(env, who.playerId, (w) => {
-        const old = w.dans[key];
-        if (old && old.acc >= acc) return false;
-        w.dans[key] = { level: dan.level, acc: Math.round(acc * 100) / 100, at: new Date().toISOString(), title: String(song.title || it.title || "").slice(0, 80), difficulty: difficulty.slice(0, 60) };
-        remember(w, { kind: "dan", level: dan.level, acc: Math.round(acc * 100) / 100 });
-      });
+      const w = await recordDanClears(env, who.playerId, [{ e, acc, at: new Date().toISOString() }]);
       if (w) await writeCosmetics(env, who.playerId, w);
     }
-    return reply({ ok: true, cleared, level: dan.level, accuracy: Math.round(acc * 100) / 100, needed: DAN_CLEAR_ACC });
+    return reply({ ok: true, cleared, level: e.dan.level, accuracy: Math.round(acc * 100) / 100, needed: DAN_CLEAR_ACC });
   }
   fail(404, "Not found");
 }
@@ -4396,6 +4645,7 @@ async function workshopRoutes(request, env, url, ctx) {
     });
     if (missing) fail(404, "That difficulty isn't in this upload.");
     if (!out) fail(404, "That song isn't in the Workshop any more.");
+    danIdx = null; verIdx = null;
     return reply({ ok: true, item: wsPublic(out) });
   }
 
@@ -4469,6 +4719,154 @@ async function workshopRoutes(request, env, url, ctx) {
       }
     }
     return reply({ ok: true, done, errors, left: todo.length - done.length, retryAfter });
+  }
+  // ---- each chart's id and osu! file fingerprint, read again from the manifests of uploads read before they were kept
+  // (verified uploads and dans first). A few uploads per call: they're downloaded whole.
+  if (path === "/api/admin/ws-chart-ids" && request.method === "POST") {
+    if (!(await officialImporter(request, env))) fail(403, "Only the developer's tools can do this.");
+    const b = await bodyOf(request, 20_000).catch(() => ({}));
+    const db = await r2json(env, WS_DB, { items: [] });
+    const known = (x) => (x.meta.songs || []).some((sg) => (sg.charts || []).some((c) => c.chartId));
+    const todo = (db.items || []).filter((x) => x.type === "charts" && !x.removed && x.meta && !x.meta.idsRead && !known(x) && (x.b2Files || []).length)
+      .sort((x, y) => Number(!!(y.verified || y.dans)) - Number(!!(x.verified || x.dans)));
+    const limit = Math.max(1, Math.min(6, Number(b.limit) || 3));
+    const done = [], errors = [];
+    for (const it of todo.slice(0, limit)) {
+      try {
+        const found = [];
+        for (const f of it.b2Files.slice(0, 9)) {
+          if (f.size > 60 * 1048576) continue;
+          const r = await b2Get(env, f.key);
+          if (!r.ok) throw new Error(`B2 answered ${r.status}`);
+          const m = await wsMeta("charts", new Uint8Array(await r.arrayBuffer()));
+          if (m) found.push(m);
+        }
+        let n = 0, md5s = 0;
+        await r2update(env, WS_DB, () => ({ items: [] }), (d) => {
+          const x = (d.items || []).find((y) => y.id === it.id);
+          if (!x || !x.meta) return false;
+          n = 0; md5s = 0;
+          for (const sg of x.meta.songs || []) {
+            const m = found.find((y) => y.songId === sg.songId);
+            if (!m) continue;
+            for (const c of sg.charts || []) {
+              const mc = (m.charts || []).find((y) => y.difficulty === c.difficulty);
+              if (!mc) continue;
+              if (mc.chartId) { c.chartId = mc.chartId; n++; }
+              if (mc.osuMd5) { c.osuMd5 = mc.osuMd5; md5s++; }
+            }
+          }
+          x.meta.idsRead = true;
+        });
+        done.push({ id: it.id, title: it.title, verified: !!it.verified, charts: n, osuMd5: md5s });
+      } catch (err) { errors.push({ id: it.id, title: it.title, error: err.message }); if (errors.length >= 2) break; }
+    }
+    verIdx = null; danIdx = null;
+    return reply({ ok: errors.length === 0, done, errors, left: Math.max(0, todo.length - done.length) });
+  }
+  // ---- dan clears from everyone's synced plays so far (copies of dans the game didn't know about). A few per call:
+  // pass every id back in "skip".
+  if (path === "/api/admin/dan-scan" && request.method === "POST") {
+    if (!(await officialImporter(request, env))) fail(403, "Only the developer's tools can do this.");
+    const b = await bodyOf(request, 50_000).catch(() => ({}));
+    const skip = new Set(Array.isArray(b.skip) ? b.skip.map(String) : []);
+    const ids = new Set();
+    for (const prefix of ["rank/players/", "points/"]) {
+      let cursor;
+      do {
+        const list = await env.RELEASES.list({ prefix, cursor });
+        for (const o of list.objects) ids.add(o.key.slice(prefix.length).replace(/\.json$/, ""));
+        cursor = list.truncated ? list.cursor : undefined;
+      } while (cursor);
+    }
+    const todo = [...ids].filter((id) => /^[A-Za-z0-9_-]{8,64}$/.test(id) && !skip.has(id)).sort();
+    const limit = Math.max(1, Math.min(25, Number(b.limit) || 15));
+    const done = [], errors = [];
+    for (const id of todo.slice(0, limit)) {
+      try {
+        const data = (await privateItems(env, id, ["scores"]).catch(() => ({}))).scores;
+        const charts = data && typeof data === "object" && data.charts && typeof data.charts === "object" ? Object.entries(data.charts) : [];
+        const reset = await r2json(env, `rank/reset/${id}.json`, null);
+        done.push({ id, added: charts.length ? await danClearsFromPlays(env, id, charts, reset ? Date.parse(reset.at) || 0 : 0) : 0 });
+      } catch (err) { errors.push({ id, error: err.message }); if (errors.length >= 3) break; }
+    }
+    return reply({ ok: errors.length === 0, done, errors, left: Math.max(0, todo.length - limit) });
+  }
+  // ---- everyone's ranking worked out again from their plays, written to the leaderboard and their card. For when the
+  // server got it wrong: it left out plays it wrongly took for impossible, kept PR formula 4 as 3, and never managed to
+  // write the leaderboard (entries stayed as games wrote them before 1.5.2). A few per call: pass every id back in
+  // "skip". The pace record starts over from the new numbers, so the correction isn't held as a jump.
+  if (path === "/api/admin/rank-recompute" && request.method === "POST") {
+    if (!(await officialImporter(request, env))) fail(403, "Only the developer's tools can do this.");
+    const b = await bodyOf(request, 50_000).catch(() => ({}));
+    const dry = b.dry === true;
+    const skip = new Set(Array.isArray(b.skip) ? b.skip.map(String) : []);
+    const cfg = config(env);
+    await loadModeration(cfg);
+    const ids = new Set();
+    {
+      let cursor;
+      do {
+        const list = await env.RELEASES.list({ prefix: "rank/players/", cursor });
+        for (const o of list.objects) ids.add(o.key.slice("rank/players/".length).replace(/\.json$/, ""));
+        cursor = list.truncated ? list.cursor : undefined;
+      } while (cursor);
+    }
+    const page = await api(`${cfg.scores}?offset=0&limit=${TOP + 10}`, cfg.auth);
+    const onBoard = new Map();
+    for (const e of page?.results || []) { ids.add(e.playerId); onBoard.set(e.playerId, e.score); }
+    const todo = [...ids].filter((id) => /^[A-Za-z0-9_-]{8,64}$/.test(id) && !isOfficial(id) && !moderation.bans[id] && !skip.has(id)).sort();
+    const limit = Math.max(1, Math.min(10, Number(b.limit) || 6));
+    const done = [], kept = [], errors = [];
+    const now = Date.now();
+    for (const id of todo.slice(0, limit)) {
+      try {
+        const key = `rank/players/${id}.json`;
+        const rec = (await r2json(env, key, null)) || { hist: [] };
+        const old = (await publicItems(cfg, id, ["card"]).catch(() => ({}))).card;
+        const r = await rankFromPlays(env, cfg, id);
+        const card = old && typeof old === "object" && !Array.isArray(old) ? old : {};
+        const name = validName(card.name) ? card.name : "Player";
+        const row = { id, name, board: onBoard.get(id) ?? null, card: typeof card.pp === "number" ? card.pp : null, pp: r.pp, level: r.level, pv: r.ppVersion, counted: r.counted, leftOut: r.problems.length };
+        if (!old) { kept.push({ ...row, why: "no card yet" }); continue; }
+        // "release": ids whose held jump was only this correction (given by name, never all)
+        const release = Array.isArray(b.release) && b.release.map(String).includes(id);
+        if (rec.held && !release) { kept.push({ ...row, why: "a jump is waiting for a moderator" }); continue; }
+        if (!isNum(r.pp, 0, V.maxTotalPR) || !isInt(r.level, 1, V.maxLevel)) { kept.push({ ...row, why: "out of range" }); continue; }
+        if (!dry) {
+          await serverWrite(async () => {
+            const meta = { n: name, l: r.level, lp: r.levelProgress, a: r.accuracy, av: typeof card.avatar === "string" ? card.avatar : "", ts: r.totalScore, pc: r.playCount, fc: r.fullCombos, pv: r.ppVersion };
+            const e = await writeScore(env, id, r.pp, meta);
+            row.rank = isInt(e?.rank, 0, 1e9) ? e.rank + 1 : 0;
+            await saveItem(env, id, "card", { ...card, pp: r.pp, accuracy: r.accuracy, level: r.level, levelProgress: r.levelProgress, totalScore: r.totalScore, xp: r.xp,
+              playCount: r.playCount, fullCombos: r.fullCombos, maxCombo: r.maxCombo, playTimeMs: r.playTimeMs, ppVersion: r.ppVersion, rank: row.rank }, true);
+          });
+          Object.assign(rec, { pp: r.pp, level: r.level, levelKnown: true, hist: [{ t: now, pp: r.pp, level: r.level }], at: new Date(now).toISOString() });
+          if (release && rec.held) {
+            delete rec.held;
+            await r2update(env, "rank/flags.json", () => ({ flags: [] }), (d) => {
+              const n = (d.flags || []).length;
+              d.flags = (d.flags || []).filter((f) => !(f.playerId === id && String(f.what || "").startsWith("held:")));
+              if (d.flags.length === n) return false;
+            });
+          }
+          await env.RELEASES.put(key, JSON.stringify(rec), { httpMetadata: { contentType: "application/json" } });
+          cards.delete(id);
+        }
+        done.push(row);
+      } catch (err) { errors.push({ id, error: err.message }); if (errors.length >= 3) break; }
+    }
+    // the "impossible plays" notes were all wrong: off the moderators' list
+    let clearedFlags = 0;
+    if (!dry && b.clearFlags === true)
+      await r2update(env, "rank/flags.json", () => ({ flags: [] }), (d) => {
+        const before = (d.flags || []).length;
+        d.flags = (d.flags || []).filter((f) => !/impossible plays? left out/.test(String(f.what || "")));
+        clearedFlags = before - d.flags.length;
+        if (!clearedFlags) return false;
+      });
+    if (done.length && !dry) { board = null; boardAt = 0; }
+    return reply({ ok: errors.length === 0, dry, done, kept, errors, clearedFlags, left: Math.max(0, todo.length - limit) });
   }
   // ---- everyone who already has an account: friends with the official OCTIVE account (a few per call)
   if (path === "/api/admin/official-friends" && request.method === "POST") {
@@ -5217,31 +5615,31 @@ export default {
     }
     if (/^\/(support\/|stripe\/webhook$|looks\/|social\/|follow$)/.test(url.pathname)) {
       try { const r = await supportRoutes(request, env, url, ctx); if (r) return r; }
-      catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message }, e.status >= 400 && e.status < 600 ? e.status : 500); }
+      catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message, code: e.code || undefined, itemId: e.itemId || undefined }, e.status >= 400 && e.status < 600 ? e.status : 500); }
     }
     if (url.pathname.startsWith("/play/")) {
       try { return await playRoutes(request, env, url); }
-      catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message }, e.status >= 400 && e.status < 600 ? e.status : 500); }
+      catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message, code: e.code || undefined, itemId: e.itemId || undefined }, e.status >= 400 && e.status < 600 ? e.status : 500); }
     }
     if (url.pathname.startsWith("/api/")) {
       try { return await workshopRoutes(request, env, url, ctx); }
-      catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message }, e.status >= 400 && e.status < 600 ? e.status : 500); }
+      catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message, code: e.code || undefined, itemId: e.itemId || undefined }, e.status >= 400 && e.status < 600 ? e.status : 500); }
     }
     if (url.pathname.startsWith("/chat/")) {
       try { return await chatRoutes(request, env, url, ctx); }
-      catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message }, e.status >= 400 && e.status < 600 ? e.status : 500); }
+      catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message, code: e.code || undefined, itemId: e.itemId || undefined }, e.status >= 400 && e.status < 600 ? e.status : 500); }
     }
     if (url.pathname.startsWith("/dm/")) {
       try { return await dmRoutes(request, env, url); }
-      catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message }, e.status >= 400 && e.status < 600 ? e.status : 500); }
+      catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message, code: e.code || undefined, itemId: e.itemId || undefined }, e.status >= 400 && e.status < 600 ? e.status : 500); }
     }
     if (url.pathname.startsWith("/scores/")) {
       try { return await chartScores(request, env, url); }
-      catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message }, e.status >= 400 && e.status < 600 ? e.status : 500); }
+      catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message, code: e.code || undefined, itemId: e.itemId || undefined }, e.status >= 400 && e.status < 600 ? e.status : 500); }
     }
     if (url.pathname.startsWith("/account/")) {
       try { return await account(request, env, url.pathname.slice(9)); }
-      catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message }, e.status >= 400 && e.status < 600 ? e.status : 500); }
+      catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message, code: e.code || undefined, itemId: e.itemId || undefined }, e.status >= 400 && e.status < 600 ? e.status : 500); }
     }
     if (request.method !== "GET") return cors(new Response("Method not allowed", { status: 405 }));
     try {
